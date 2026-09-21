@@ -1,0 +1,7 @@
+# Core ML — the only required dependency for the semantic classifier
+sentence-transformers>=2.2.0
+torch>=2.0.0
+
+# All other modules (router_escalation, router_tiers, anthropic_shim,
+# switchyard_signals, the proxy template, the test files) use only the
+# Python standard library. No flask, no fastapi, no requests, no httpx.

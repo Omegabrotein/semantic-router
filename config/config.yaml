@@ -1,0 +1,415 @@
+# vLLM Semantic Router — 4-tier cost-optimized routing
+# Tiers: local Qwen3 (free) → GLM → Kimi → Claude Sonnet → Claude Opus (frontier)
+# Upstreams: local vLLM on :8001, 9Router gateway on :20128
+version: v0.3
+
+listeners:
+  - name: http-8899
+    address: 0.0.0.0
+    port: 8899
+    timeout: 300s
+
+providers:
+  defaults:
+    default_model: tier-fast
+    default_reasoning_effort: low
+    reasoning_families:
+      qwen3:
+        type: chat_template_kwargs
+        parameter: enable_thinking
+      gpt:
+        type: reasoning_effort
+        parameter: reasoning_effort
+  models:
+    # ---- Tier 1: LOCAL (Claude Haiku via 9Router, first tier of tier-fast combo) ----
+    - name: tier-fast
+      provider_model_id: tier-fast
+      api_format: openai
+      reasoning_family: gpt
+      pricing:
+        currency: USD
+        prompt_per_1m: 0.8
+        completion_per_1m: 4.0
+      backend_refs:
+        - name: nine-router
+          base_url: http://127.0.0.1:20128
+          provider: openai
+          auth_header: Authorization
+          auth_prefix: Bearer
+          chat_path: /v1/chat/completions
+          api_key: <<<REDACTED-OPENAI-STYLE-KEY>>>
+          weight: 100
+
+    # ---- Tier 2: STANDARD (GLM cheap) ----
+    - name: tier-standard
+      provider_model_id: tier-standard
+      api_format: openai
+      pricing:
+        currency: USD
+        prompt_per_1m: 0.1
+        completion_per_1m: 0.5
+      backend_refs:
+        - name: nine-router
+          base_url: http://127.0.0.1:20128
+          provider: openai
+          auth_header: Authorization
+          auth_prefix: Bearer
+          chat_path: /v1/chat/completions
+          api_key: <<<REDACTED-OPENAI-STYLE-KEY>>>
+          weight: 100
+
+    # ---- Tier 3: REASONING (Claude Sonnet) ----
+    - name: tier-reasoning
+      provider_model_id: tier-reasoning
+      api_format: openai
+      reasoning_family: gpt
+      pricing:
+        currency: USD
+        prompt_per_1m: 3.0
+        completion_per_1m: 15.0
+      backend_refs:
+        - name: nine-router
+          base_url: http://127.0.0.1:20128
+          provider: openai
+          auth_header: Authorization
+          auth_prefix: Bearer
+          chat_path: /v1/chat/completions
+          api_key: <<<REDACTED-OPENAI-STYLE-KEY>>>
+          weight: 100
+
+    # ---- Tier 4: FRONTIER (Claude Opus/Fable) ----
+    - name: tier-frontier
+      provider_model_id: tier-frontier
+      api_format: openai
+      reasoning_family: gpt
+      pricing:
+        currency: USD
+        prompt_per_1m: 10.0
+        completion_per_1m: 50.0
+      backend_refs:
+        - name: nine-router
+          base_url: http://127.0.0.1:20128
+          provider: openai
+          auth_header: Authorization
+          auth_prefix: Bearer
+          chat_path: /v1/chat/completions
+          api_key: <<<REDACTED-OPENAI-STYLE-KEY>>>
+          weight: 100
+
+    # ---- Tier 5: OPENAI (ChatGPT Plus / Codex Sol) ----
+    - name: gpt-5.6-sol
+      provider_model_id: gpt-5.6-sol
+      api_format: openai
+      reasoning_family: gpt
+      pricing:
+        currency: USD
+        prompt_per_1m: 2.0
+        completion_per_1m: 8.0
+      backend_refs:
+        - name: nine-router
+          base_url: http://127.0.0.1:20128
+          provider: openai
+          auth_header: Authorization
+          auth_prefix: Bearer
+          chat_path: /v1/chat/completions
+          api_key: <<<REDACTED-OPENAI-STYLE-KEY>>>
+          weight: 100
+
+    # ---- Tier 6: OPENAI GPT-5.5 (ChatGPT Plus / Codex, standard model) ----
+    - name: gpt-5.5
+      provider_model_id: gpt-5.5
+      api_format: openai
+      reasoning_family: gpt
+      pricing:
+        currency: USD
+        prompt_per_1m: 1.5
+        completion_per_1m: 6.0
+      backend_refs:
+        - name: nine-router
+          base_url: http://127.0.0.1:20128
+          provider: openai
+          auth_header: Authorization
+          auth_prefix: Bearer
+          chat_path: /v1/chat/completions
+          api_key: «redacted:sk-…»
+          weight: 100
+
+    # ---- Tier 7: LOCAL QWEN3.8-27B (DGX Spark SGLang, free, abliterated, DFlash2) ----
+    # Sep 6, 2026: replaces the old vLLM FP8 path. SGLang + NVFP4 + DFlash2 spec
+    # decoding gives ~57 tok/s single-stream on a single DGX Spark. Exposed as
+    # `custom:local-qwen38` in Hermes profiles and as primary fallback when all
+    # cloud tiers are exhausted. Safe to route here on long-context agent turns.
+    - name: local-qwen38
+      provider_model_id: qwen38-27b-abliterated
+      api_format: openai
+      reasoning_family: qwen3
+      pricing:
+        currency: USD
+        prompt_per_1m: 0.0
+        completion_per_1m: 0.0
+      backend_refs:
+        - name: sglang-local
+          base_url: http://127.0.0.1:11434
+          provider: openai
+          auth_header: Authorization
+          auth_prefix: Bearer
+          chat_path: /v1/chat/completions
+          api_key: sk-local-not-required
+          weight: 100
+
+routing:
+  modelCards:
+    - name: tier-fast
+      param_size: unknown
+      context_window_size: 200000
+      description: Claude Haiku via 9Router. Default for easy/everyday prompts (faster, cheaper than Sonnet).
+      capabilities: [chat, reasoning, tools, long-context]
+      quality_score: 0.82
+      modality: ar
+      tags: [default, free, local]
+    - name: tier-standard
+      param_size: unknown
+      context_window_size: 131072
+      description: GLM via 9Router. Cheap paid tier for standard tasks.
+      capabilities: [chat, long-context]
+      quality_score: 0.88
+      modality: ar
+      tags: [standard]
+    - name: tier-reasoning
+      param_size: unknown
+      context_window_size: 200000
+      description: Claude Sonnet via 9Router. Strong reasoning/coding.
+      capabilities: [chat, reasoning, tools, long-context]
+      quality_score: 0.95
+      modality: ar
+      tags: [reasoning, premium]
+    - name: tier-frontier
+      param_size: unknown
+      context_window_size: 200000
+      description: Claude Opus/Fable via 9Router. Hardest problems only.
+      capabilities: [chat, reasoning, tools, long-context]
+      quality_score: 0.99
+      modality: ar
+      tags: [frontier, premium]
+    - name: gpt-5.6-sol
+      param_size: unknown
+      context_window_size: 200000
+      description: OpenAI GPT-5.6 Sol (ChatGPT Plus/Codex). Strong reasoning, Sonnet alternative.
+      capabilities: [chat, reasoning, tools, long-context]
+      quality_score: 0.95
+      modality: ar
+      tags: [reasoning, premium, openai]
+    - name: gpt-5.5
+      param_size: unknown
+      context_window_size: 200000
+      description: OpenAI GPT-5.5 (ChatGPT Plus/Codex). Strong general assistant, Q&A, chat.
+      capabilities: [chat, reasoning, tools, long-context]
+      quality_score: 0.93
+      modality: ar
+      tags: [general, assistant, openai]
+
+    - name: local-qwen38
+      param_size: 27000000000
+      context_window_size: 262144
+      description: Local Qwen3.8-27B abliterated (NVFP4, SGLang, DFlash2). Sep 6 2026.
+      capabilities: [chat, reasoning, tools, long-context]
+      quality_score: 0.85
+      modality: ar
+      tags: [local, default, free, abliterated]
+
+  signals:
+    # Complexity signal: embedding-based easy vs hard discrimination
+    complexity:
+      - name: prompt_difficulty
+        threshold: 0.6
+        description: Classifies prompt difficulty for tier routing.
+        easy:
+          candidates:
+            - answer briefly in one sentence
+            - simple yes or no question
+            - quick summary of this text
+            - rewrite this sentence
+            - what time is it
+            - hello how are you
+            - translate this word
+        hard:
+          candidates:
+            - solve this step by step
+            - explain why this happens
+            - write code to implement this
+            - analyze this problem carefully
+            - compare and evaluate these options
+            - debug this error and find the cause
+            - prove or derive this result
+            - design a system or architecture
+            - how does this work in detail
+            - explain the reasoning behind this
+
+    # KEYWORD SIGNALS REMOVED Sep 19 2026 per user directive. The semantic
+    # router uses BERT embeddings (signals.embedding_based) only. To avoid
+    # a "no signals defined" warning in the vLLM semantic-router image we
+    # keep the section with a single empty placeholder. All routing
+    # decisions now flow through the embedding_classification block above.
+
+    # Guard against misrouting substantial turns (long history, tool schemas,
+    # multi-tool-call agent loops) to the small 65536-token local tier just
+    # because a trivial keyword happens to appear somewhere in the payload
+    context:
+      - name: long_context
+        min_tokens: 8K
+        max_tokens: 256K
+        description: Requests already carrying enough tokens that they must
+          not be routed to the 65536-token local tier, regardless of keyword
+          matches (agent/tool-heavy turns, long history).
+
+    # Domain signal from built-in BERT classifier
+    domains:
+      - name: general
+        description: General knowledge and miscellaneous
+        mmlu_categories: [other]
+
+  # Priority-ordered decisions: FIRST match wins. Escalation checks come FIRST.
+  # 3-tier: local (free, default) → tier-standard (GLM, routine) → tier-reasoning (Claude, hard).
+  decisions:
+    # 1. HARD frontier keywords → Claude Sonnet (best for code/arch/debug).
+    - name: tier_frontier_hard
+      description: Architecture/concurrency/perf/subtle-bug → Claude Sonnet.
+      priority: 100
+      rules:
+        operator: AND
+        conditions:
+          - type: keyword
+            name: frontier_reasoning
+      modelRefs:
+        - model: tier-reasoning
+          use_reasoning: true
+          reasoning_effort: high
+      algorithm:
+        type: static
+
+    # 2. OPENAI-affinity keywords → GPT-5.6 Sol (research/creative/analysis).
+    - name: tier_openai_affinity
+      description: Research/creative/analysis → OpenAI Sol (ChatGPT Plus).
+      priority: 95
+      rules:
+        operator: AND
+        conditions:
+          - type: keyword
+            name: openai_affinity
+      modelRefs:
+        - model: gpt-5.6-sol
+          use_reasoning: true
+          reasoning_effort: high
+      algorithm:
+        type: static
+
+    # GPT-5.5 general assistant → OpenAI standard model (ChatGPT Plus).
+    - name: tier_gpt55_general
+      description: How-to/Q&A/advice/everyday → GPT-5.5 (ChatGPT Plus).
+      priority: 92
+      rules:
+        operator: AND
+        conditions:
+          - type: keyword
+            name: gpt55_general
+      modelRefs:
+        - model: gpt-5.5
+          use_reasoning: true
+          reasoning_effort: medium
+      algorithm:
+        type: static
+
+    # 2. ROUTINE reasoning keywords → GLM (tier-standard). Cheap subscription tier.
+    - name: tier_standard_routine
+      description: Proofs/coding/algorithms → GLM (not Claude).
+      priority: 90
+      rules:
+        operator: AND
+        conditions:
+          - type: keyword
+            name: routine_reasoning
+      modelRefs:
+        - model: tier-standard
+          use_reasoning: true
+          reasoning_effort: medium
+      algorithm:
+        type: static
+
+    # 3. Trivial chit-chat → local, free. Guarded: skip if the request is
+    # already long/tool-heavy (long_context) — such turns must not be forced
+    # onto the 65536-token local tier just because a greeting keyword matched
+    # somewhere in a large agent/tool payload (see context.long_context above).
+    - name: tier_fast_trivial
+      description: Trivial greetings and one-word answers stay local (unless the request is already long-context/tool-heavy).
+      priority: 50
+      rules:
+        operator: AND
+        conditions:
+          - type: keyword
+            name: trivial_intent
+          - operator: NOT
+            conditions:
+              - type: context
+                name: long_context
+      modelRefs:
+        - model: tier-fast
+          use_reasoning: false
+      algorithm:
+        type: static
+
+    # Sep 9 2026: explicit local-qwen opt-in. Routes to local-qwen38
+    # when the request contains "local", "offline", "qwen38", etc.
+    # vLLM Semantic Router v0.3.0 has no native runtime-fallback signal, so
+    # this is keyword-driven. Lower priority than tier_frontier_hard so a
+    # Claude-worthy prompt that happens to mention "local" still wins.
+    - name: tier_local_opt_in
+      description: Explicit local-qwen opt-in via "local" / "offline" / "qwen38" keyword.
+      priority: 40
+      rules:
+        operator: AND
+        conditions:
+          - type: keyword
+            name: local_opt_in
+      modelRefs:
+        - model: local-qwen38
+          use_reasoning: true
+          reasoning_effort: medium
+      algorithm:
+        type: static
+
+    # Note: no catch-all. Unmatched prompts (the majority) fall through to the
+    # request's own model field. Clients send model="auto" → router assigns
+    # tier-fast = free Qwen3-30B. Only frontier/routine keywords escalate.
+
+global:
+  router:
+    strategy: priority
+
+  # Classifier model registry — tells router which HF models to download & load
+  model_catalog:
+    system:
+      prompt_guard: models/mmbert32k-jailbreak-detector-merged
+      domain_classifier: models/mmbert32k-intent-classifier-merged
+      pii_classifier: models/mmbert32k-pii-detector-merged
+  services:
+    api:
+      batch_classification:
+        max_batch_size: 32
+        concurrency_threshold: 5
+        max_concurrency: 4
+        metrics:
+          enabled: true
+          sample_rate: 1.0
+  stores:
+    semantic_cache:
+      enabled: true
+      backend_type: memory
+      similarity_threshold: 0.85
+      max_entries: 1000
+      ttl_seconds: 3600
+      eviction_policy: fifo
+      embedding_model: mmbert
+    memory:
+      embedding_model: mmbert
+    vector_store:
+      embedding_model: mmbert

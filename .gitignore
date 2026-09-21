@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local config overrides — never commit
+config/*.local.yaml
+.env
+.env.local
+
+# Model cache (downloaded by sentence-transformers on first run)
+models/
+.cache/
+
+# Backup / snapshot files (operator-local artifacts)
+*.bak-*
+*.bak
+*-v1.py
+*-v2.py
+*-v3*.py
+*-backup.py
