@@ -128,7 +128,7 @@ TIER_SYSTEM = {
         "domains": ["trading_emergency", "trading_decision"],
     },
     "tier_fallback": {
-        # Sep 19 2026 REBALANCE: M3 first, then Kimi (last-resort per Q3),
+        # Sep 21 2026 REBALANCE: M3 first, then Kimi (last-resort per Q3),
         # then ChatGPT Plus (cx/*) as overflow (Q5 demote), then local Qwen
         # as the final free safety net.
         "name": "M3 → kimi → cx-luna → cx-terra → cx-luna-review → local Qwen (Last Resort Fallback)",
@@ -138,19 +138,29 @@ TIER_SYSTEM = {
             "cx/gpt-5.6-luna",          # demoted to fallback only (Q5-C)
             "cx/gpt-5.6-terra",
             "cx/gpt-5.6-luna-review",
-            "local/qwen38-27b-abliterated",  # final free safety net
+            "local/hermes-agent",       # final free safety net — MOA gateway
         ],
         "plan": "minimax_m3",
         "domains": None,
     },
     "tier_local": {
-        # Sep 19 2026: free local lane. SGLang qwen38-27b-abliterated on the
-        # DGX Spark (127.0.0.1:11434), 262144-token window, $0/token.
-        # Cheap domains route here FIRST and degrade sideways into the cloud
-        # cheap tiers if the box is down. Never reachable from a frontier or
-        # trading primary (CHEAP_TIERS membership only).
-        "name": "local Qwen3.8-27B abliterated (Free / Spark)",
-        "models": ["local/qwen38-27b-abliterated"],
+        # Sep 21 2026 19:16 PDT REVERT (user confirmed): a sibling agent
+        # swapped this to MOA / hermes-agent at end of day; user did not
+        # request it. Pointed BACK at SGLang qwen3-30b-a3b-instruct-2507
+        # @ :11435 (SGLang container healthy, 65 tok/s verified). The
+        # MOA gateway at :8642 is left untouched and the system defaults
+        # MOA_LOCAL_URL=/MODEL are bumped, so a future SGLang outage can
+        # still flip to MOA via env vars without code changes.
+        #
+        # History:
+        #   - Sep 19: SGLang qwen38-27b-abliterated @ :11434
+        #   - Sep 21 AM: SGLang qwen3-30b-a3b-instruct-2507 @ :11435
+        #   - Sep 21 PM: MOA hermes-agent @ :8642 (REVERTED below)
+        # Cheap domains route here FIRST and degrade sideways into the
+        # cloud cheap tiers if SGLang is down. Never reachable from a
+        # frontier or trading primary (CHEAP_TIERS membership only).
+        "name": "SGLang qwen3-30b-a3b-instruct-2507 (Free / Local :11435)",
+        "models": ["local/qwen3-30b-a3b-instruct-2507"],
         "plan": "local_free",
         "domains": ["general_easy", "coding_routine", "personal"],
     },

@@ -586,6 +586,11 @@ def classify_semantic(prompt: str) -> Dict[str, Any]:
             "demoted_to_fast": demoted_to_fast,  # Phase 4 telemetry flag
             "demote_reason": demote_reason,      # Phase 4b telemetry
             "all_scores": {k: round(float(v), 3) for k, v in sorted_scores[:3]},
+            # Sep 21 2026 — exposed for classifier_hybrid.maybe_hybrid_override().
+            # Internal key (underscore-prefixed) so it doesn't leak into the
+            # public response shape or the /v1/models card.
+            "_all_dense_scores": {k: round(float(v), 4) for k, v in domain_avg.items()},
+            "_dense_argmax": best_domain,
         }
     except Exception as e:
         # Sep 19 2026 — keyword fallback removed per user directive. Re-raise
@@ -635,8 +640,66 @@ def classify(prompt: str) -> Dict[str, Any]:
             f"sentence_transformers unavailable: {ML_IMPORT_ERROR}"
         )
 
+    semantic = classify_semantic(prompt)
+
+    # Sep 21 2026 — Hybrid BM25+dense second opinion (steal #1 from
+    # aurelio-labs/semantic-router). Consulted in the dense confusion band.
+    # When BM25 has a clearly better answer, override the dense domain and
+    # re-resolve the tier from TIER_MAP. Phase 4 (TRADING_FLOOR,
+    # PER_DOMAIN_CAP, SHORT_PROMPT_CHARS) was already applied inside
+    # classify_semantic() — we re-run the demote check on the new domain
+    # so the trading-floor invariant survives a swap.
+    try:
+        from classifier_hybrid import maybe_hybrid_override
+        dense_scores = semantic.get("_all_dense_scores") or {}
+        if dense_scores:
+            override = maybe_hybrid_override(
+                prompt,
+                dense_scores=dense_scores,
+                dense_argmax=semantic.get("_dense_argmax") or semantic["domain"],
+                dense_score=semantic.get("top_similarity", 0.0),
+            )
+            if override and override.get("method") == "hybrid":
+                new_domain = override["domain"]
+                # Re-resolve tier for the new domain. Phase 4 demote was
+                # already applied to the original domain; for a non-trading
+                # domain swap the tier is just TIER_MAP.get(new_domain).
+                # For a trading_* swap (rare — BM25 rarely overrides into
+                # trading), honor TRADING_FLOOR by checking dense_score.
+                if new_domain.startswith("trading_"):
+                    # Only honor trading-floor override if dense was
+                    # actually confident in the original trading domain.
+                    # Otherwise we'd let BM25 manufacture a trading_decision.
+                    if semantic.get("top_similarity", 0.0) < TRADING_FLOOR:
+                        # Don't let BM25 promote to trading without dense
+                        # backing — keep dense's domain.
+                        pass
+                    else:
+                        semantic["domain"] = new_domain
+                        semantic["tier"] = TIER_MAP.get(new_domain, DEFAULT_TIER)["tier"]
+                else:
+                    semantic["domain"] = new_domain
+                    semantic["tier"] = TIER_MAP.get(new_domain, DEFAULT_TIER)["tier"]
+                semantic["method"] = "hybrid"
+                semantic["hybrid_blended"] = override.get("hybrid_blended")
+                semantic["hybrid_bm25_top"] = override.get("hybrid_bm25_top")
+                # Re-flag demotion state for the new domain.
+                if semantic["tier"] in ("tier-fast", "tier_quota_burn", "tier_local", "tier-general"):
+                    semantic["demoted_to_fast"] = True
+                    semantic["demote_reason"] = (
+                        semantic.get("demote_reason") or "hybrid_override_cheap_tier"
+                    )
+    except ImportError:
+        # rank-bm25 not installed — silent fallback to dense-only. The Sep 19
+        # "strictly semantic" invariant is preserved.
+        pass
+    except Exception as _exc:
+        # Any other hybrid failure (BM25 build error, score normalize crash)
+        # must NOT break routing. Log and serve dense result.
+        logger.debug(f"hybrid override skipped: {_exc}")
+
     _metric_inc("semantic_success")
-    return classify_semantic(prompt)
+    return semantic
 
 
 def get_metrics() -> Dict[str, Any]:

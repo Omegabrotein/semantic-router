@@ -58,8 +58,9 @@ ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "cc/claude-fable-5-1")
 # walks this list and uses the first model that answers. MiniMax-M3 (13B
 # tok/mo) is the durable tail.
 # A local model in front of the cloud chain is the cheapest, most reliable
-# judge. Set ROUTER_JUDGE_LOCAL_URL=http://127.0.0.1:11434/v1 and
-# ROUTER_JUDGE_LOCAL_MODEL=qwen38-27b-abliterated to enable.
+# judge. Set ROUTER_JUDGE_LOCAL_URL=http://127.0.0.1:8642/v1 and
+# ROUTER_JUDGE_LOCAL_MODEL=hermes-agent to enable (MOA gateway, Sep 21 PM
+# — was SGLang qwen38-27b-abliterated @ :11434 earlier the same day).
 # The local model is tried FIRST; only if it returns nothing parseable do
 # we walk the cloud chain. This eliminates the "GLM quota-capped -> judge
 # fails open every turn" failure mode for free.
@@ -357,6 +358,19 @@ class StatsTracker:
             "advisor_approve": 0,
             "advisor_failed": 0,
             "invariant_violations": 0,
+            # Sep 21 2026 — Steal #1 (hybrid) counters. hybrid_eligible
+            # counts every prompt BM25 was consulted for; hybrid_override
+            # counts prompts where BM25 changed the dense decision. A gap
+            # between the two is normal (agreement is a no-op).
+            "hybrid_eligible": 0,
+            "hybrid_override": 0,
+            # Sep 21 2026 — Steal #2 (tool pre-select) counters.
+            # tools_narrowed_count: requests where narrow_tools() shrank the
+            # tools list. tools_narrowed_tools_saved: total tools filtered out
+            # (sum across all narrowed requests) — measures how much decision
+            # space Opus/Fable DIDN'T have to sift through.
+            "tools_narrowed_count": 0,
+            "tools_narrowed_tools_saved": 0,
         }
         self.started = time.time()
 
@@ -794,19 +808,27 @@ def call_judge_local(payload, *, timeout=120):
     import json as _json, socket, urllib.request as _ur
     base = _LOCAL_JUDGE_URL.rstrip("/")
     # Build candidate URLs: configured first, then host IP fallbacks.
+    # Sep 21 2026 — local judge candidates updated for MOA. The MOA
+    # local MOA gateway at 127.0.0.1:8642 is the primary; the
+    # old :11434/:11435 SGLang URLs are kept as fallbacks (they may
+    # come back if SGLang restarts, or the operator may have multiple
+    # boxes running different model versions).
     candidates = [base]
     try:
         host = socket.gethostname()
         # Tailscale-style 100.x IPv4 (CGNAT range)
         tailscale_ip = socket.gethostbyname(host)
         candidates += [
+            f"http://{tailscale_ip}:8642/v1",
+            f"http://[{socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]}]:8642/v1",
+            f"http://{tailscale_ip}:11435/v1",
             f"http://{tailscale_ip}:11434/v1",
-            f"http://[{socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]}]:11434/v1",
         ]
     except Exception:
         pass
     candidates += [
-        "http://127.0.0.1:11434/v1",
+        "http://127.0.0.1:8642/v1",     # MOA gateway (current primary)
+        "http://127.0.0.1:11434/v1",         # legacy SGLang ports
         "http://[::1]:11434/v1",
     ]
     # De-dupe, preserve order, drop anything that doesn't look like a chat URL.

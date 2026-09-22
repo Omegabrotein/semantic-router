@@ -139,6 +139,16 @@ providers:
     # decoding gives ~57 tok/s single-stream on a single DGX Spark. Exposed as
     # `custom:local-qwen38` in Hermes profiles and as primary fallback when all
     # cloud tiers are exhausted. Safe to route here on long-context agent turns.
+    #
+    # **STATUS (Sep 21 2026 PM) — ARCHIVED:** This config is no longer in the
+    # production routing path. The current primary free-tier is MOA
+    # `hermes-agent` @ 127.0.0.1:8642 (gateway on the Spark); the
+    # SGLang qwen3-30b-a3b container at :11435 is the in-cluster backup.
+    # See `~/semantic-router/router_tiers.py` (tier_local) and the
+    # MOA_LOCAL_* env vars on the systemd units for current wiring.
+    # This YAML block is preserved as a historical spec for re-enabling
+    # vLLM semantic-router if needed. The envoy container at :8899 is
+    # itself inert on this host — its /etc/envoy/envoy.yaml was deleted.
     - name: local-qwen38
       provider_model_id: qwen38-27b-abliterated
       api_format: openai
@@ -154,7 +164,7 @@ providers:
           auth_header: Authorization
           auth_prefix: Bearer
           chat_path: /v1/chat/completions
-          api_key: sk-local-not-required
+          api_key: «redacted:sk-…»
           weight: 100
 
 routing:

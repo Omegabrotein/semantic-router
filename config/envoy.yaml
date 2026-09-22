@@ -41,19 +41,22 @@ static_resources:
               - "x-vsr-looper-decision"
               - "x-vsr-looper-iteration"
               routes:
-              # Sep 9 2026: local-qwen38 → sglang container, NOT 9Router.
+              # Sep 21 2026: local-qwen route now points at MOA gateway
+              # hermes-agent @ 127.0.0.1:8642 (was SGLang qwen38 on
+              # :11434, then qwen3-30b on :11435 earlier the same day).
               # The ext_proc router sets x-selected-model after classification;
               # this rule must sit BEFORE the catch-all below because Envoy
               # matches routes top-down and the catch-all swallows everything.
-              # No Authorization header is injected here: the sglang container
-              # runs with api_key=None and rejects nothing, while the 9Router
-              # bearer below is meaningless to it.
+              # Authorization header is REQUIRED for MOA — use the same
+              # API_SERVER_KEY that the systemd proxies use (see
+              # ~/.hermes/.env and the systemd drop-ins at
+              # ~/.config/systemd/user/*/moa-local.conf).
               - match:
                   prefix: "/"
                   headers:
                   - name: "x-selected-model"
                     string_match:
-                      exact: "local-qwen38"
+                      exact: "local-qwen"
                 route:
                   cluster: local_vllm_cluster
                   timeout: 300s
@@ -120,10 +123,13 @@ static_resources:
                 address: 127.0.0.1
                 port_value: 50051
 
-  # Local SGLang (qwen38-27b-abliterated, NVFP4 + DFlash2) — free
-  # Sep 9 2026: repointed from the dead vLLM FP8 path (127.0.0.1:8001) to the
-  # sglang-qwen38-nvfp4 container. That container binds ONLY the Tailscale
-  # address, so 127.0.0.1 does not reach it — use 127.0.0.1 explicitly.
+  # Local MOA gateway (hermes-agent @ :8642) — primary free-tier on the Spark
+  # Sep 21 2026: was SGLang qwen3-30b-a3b-instruct-2507 NVFP4 + MoE at :11435,
+  # which was itself the successor to qwen38-27b-abliterated @ :11434 (Sep 19).
+  # Container is hermes-agent; MOA gateway runs as user `hermes` on the Spark.
+  # The SGLang qwen3-30b-a3b container is kept alive as the in-cluster backup.
+  # Sep 21 2026: container binds on Tailscale address 127.0.0.1 too, but Envoy
+  # also listens on the host network so 127.0.0.1 reachability works.
   - name: local_vllm_cluster
     connect_timeout: 30s
     type: STATIC
@@ -136,7 +142,7 @@ static_resources:
             address:
               socket_address:
                 address: 127.0.0.1
-                port_value: 11434
+                port_value: 8642
     typed_extension_protocol_options:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions

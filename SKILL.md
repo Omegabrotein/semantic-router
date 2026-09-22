@@ -225,11 +225,148 @@ section 5; the protocol below is the reusable procedure.
 
 **Pitfalls specific to shadow-mode:**
 
-- **Don't read `x-model-used` from the response inside the hook.** The
+- Don't read `x-model-used` from the response inside the hook.** The
   hook fires on the request path, before the existing pipeline has
   decided what to serve. Coupling the hook to the response adds
   complexity the shadow phase doesn't need — join the two at analysis
   time.
+
+## Stealing concrete patterns from upstream routers
+
+Three patterns are reusable from any upstream router library
+(`aurelio-labs/semantic-router`, `litellm`, `neira`, `portkey`).
+Each is additive — they slot into the existing pipeline without
+replacing it.
+
+### 1. Max-fusion for second-opinion classifiers (NOT weighted average)
+
+When porting a second-opinion classifier (BM25, LLM-judge, regex) as a
+shadow override on top of the dense embedding classifier, **never**
+blend with `ALPHA * dense + (1-ALPHA) * bm25`. A weighted average forces
+both signals to vote, so a confident-but-wrong dense signal drowns out a
+correct BM25 signal. The right primitive is **per-domain max** after
+per-query normalization:
+
+```python
+# Per-query max-normalize BM25 to 0..1 (raw BM25 is 0..~15, dense is 0..1)
+bm25_norm = {d: s / max(bm25_raw.values()) for d, s in bm25_raw.items()}
+# blended(d) = max(dense(d), bm25_norm(d)) — either modality wins
+blended = {d: max(dense.get(d, 0.0), bm25_norm.get(d, 0.0))
+           for d in set(dense) | set(bm25_norm)}
+```
+
+Override when the blended argmax disagrees with dense AND the margin
+exceeds a tight threshold (0.02 — anything larger lets dense win by
+accident). **Override fires unconditionally, NOT gated by confusion
+band:** a confident dense score (0.38 on a 3-word prompt) can still be
+wrong; band-gating skips the actual rescue cases. Verified live Sep 21:
+"exit code 1" → dense: trading_decision 0.38 → blended wins → BM25's
+coding_hard override fires.
+
+### 2. Domain-keyed tool pre-selection
+
+A route can carry a tool-allowlist — when the route fires, the proxy
+narrows `request_data["tools"]` to only the prefixes the domain needs.
+This shrinks the upstream model's tool-pick space and stops Opus from
+picking `cronjob_manage` during a margin-call conversation. Conservative
+default: unknown domains pass the full catalog unchanged (better to
+over-deliver tools than silently strip a needed one).
+
+Three rules that matter:
+
+1. **Filter result is a NEW dict only when the list actually changes** —
+   same-dict identity preserves cache-key shortcuts in the conversation
+   cache key.
+2. **Audit fields** (`_tools_narrowed_from`, `_tools_narrowed_to`)
+   attached only when narrowing fired — surfaces in `/v1/stats` via a
+   `tools_narrowed_count` counter so an operator can confirm savings.
+3. **After narrowing, re-derive the conversation cache key** from the
+   narrowed `request_data`. Otherwise a cached response built for the
+   wide tool set gets served to a now-narrowed request.
+
+Wire it AFTER the classification cache write (so the narrowed domain
+follows the sticky session domain) and BEFORE the response-cache get
+(so cache hits see the same narrowed key).
+
+### 3. YAML config with strict schema + defaults fallback
+
+Decouple the route bank + thresholds + tool allowlist from code. The
+loader:
+
+- Reads `ROUTER_CONFIG_PATH` env-var (default: `router_config.yaml` next
+  to the module) **at import time** — module-level constant.
+- On ANY failure (file missing, malformed YAML, `schema_version` mismatch)
+  returns the in-code DEFAULTS dict + logs a warning. NEVER raises — the
+  proxy must serve traffic even when config is broken.
+- Exposes `get_examples()`, `get_tool_preselection()`, etc. that callers
+  merge over their own defaults (`merged = {**defaults, **yaml_overlay}`
+  per-key). YAML wins per-key; unknown YAML keys are ignored.
+- The `enabled: false` toggle for a whole section must short-circuit the
+  YAML path entirely — when disabled, callers fall back to code defaults
+  even if `by_domain:` is populated.
+
+### 4. Bump StatsTracker counters at the feature's entrypoint, not the consumer
+
+When a feature adds a counter to `StatsTracker.counters`, the `bump()`
+call lives **at the entrypoint of the feature that produced the event**,
+not at the place that reads the result. Example: a hybrid-classifier
+override counter (`hybrid_override`) bumps in the proxy immediately
+after `cls = _classify_conversation(...)`, not in `/v1/stats`. If you
+bump at the reader, the counter is missing on requests that bypass the
+reader (cache hits, errors, short-circuits).
+
+### Pitfall — modules that read env-vars at import time break pytest monkeypatch
+
+If a module does `_CONFIG_PATH = os.environ.get("ROUTER_CONFIG_PATH", ...)`
+at module scope, then `monkeypatch.setenv("ROUTER_CONFIG_PATH", "/tmp/test.yaml")`
+in a pytest fixture runs AFTER the module is imported — the module's
+`_CONFIG_PATH` is already bound to the original value. Symptom: every
+test that depends on the env override fails with assertion errors
+against the wrong YAML.
+
+The fix is a per-test reimport. Pattern:
+
+```python
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch, tmp_path):
+    monkeypatch.setenv("ROUTER_CONFIG_PATH", str(tmp_path / "x.yaml"))
+    sys.modules.pop("router_config_loader", None)        # purge cached module
+    import router_config_loader as _fresh                # reimport binds env
+    yield
+
+def _reload(content: str):
+    """Reimport + write YAML content. Tests use the returned fresh module."""
+    sys.modules.pop("router_config_loader", None)
+    import router_config_loader as fresh
+    Path(fresh._CONFIG_PATH).write_text(textwrap.dedent(content))
+    return fresh
+
+def test_something(tmp_path):
+    fresh = _reload("schema_version: 1\n...")
+    assert fresh.get_thresholds()["x"] == 1
+```
+
+The fixture ensures the module is reimported once per test, and the
+helper lets individual tests write content AFTER import (the env was
+set at fixture setup time). Use the `fresh` module reference inside
+tests, never the top-level `loader` — that one is the pre-fixture
+import.
+
+The same import-time-vs-runtime trap exists in **systemd drop-ins**:
+`Environment=KEY=${OTHER_VAR}` in a drop-in does NOT substitute
+`${OTHER_VAR}` from a sibling `EnvironmentFile=` line — systemd
+resolves `Environment=` lines literally and only expands against the
+service manager's own env (which the user-systemd manager does NOT
+inherit from the shell). Verified Sep 21 2026 PM: a drop-in with
+`EnvironmentFile=~/.hermes/.env` plus
+`Environment=MOA_LOCAL_KEY=${API_SERVER_KEY}` resulted in the literal
+string `${API_SERVER_KEY}` being passed to the process — every
+request authenticated as the literal string `${API_SERVER_KEY}`,
+failing with HTTP 401 from the MOA gateway. The fix is to inline
+the value at drop-in write time and `chmod 600` the file (since it
+now contains a real key). Drop-ins that need to share a secret from
+a `.env` file should be generated by a small script that reads the
+secret and writes the literal into the drop-in.
 - **Don't fail-open on the shadow's own bug.** A failing JSONL write
   should swallow and log debug, but never break the proxy. The wrapper
   is the rule, not a suggestion.
@@ -597,6 +734,16 @@ start time predates your latest fix and doesn't match the current
 `systemctl status` `Main PID`, it's an orphan. Kill it and let systemd bind
 the port; only then does `Restart=on-failure` protection actually apply.
 
+**Symmetric check at the script level:** a restart script that compares
+`MainPID == listener_pid` at restart time is NOT sufficient on its own.
+systemd may mark the unit `inactive` while an orphan is still squatting
+on the port; the script's compare-then-print-OK will pass at the moment
+of restart, then quietly drift. Add `systemctl --user is-active $unit`
+to the check — both `state == active` AND `MainPID == listener_pid`
+must hold. If `state != active` but a listener exists, an orphan is
+squatting and the unit is dead; the script should kill the listener
+and `systemctl --user restart $unit` (verified Sep 21 2026, port 8898/8901/8902).
+
 ### Calling Claude Models Directly Through 9Router Returns SSE Even for `stream:false`
 
 9Router's OpenAI-compatible endpoint (`:20128/v1/chat/completions`) can
@@ -701,6 +848,64 @@ session that landed Phase 4 had to patch `smart-router-proxy.py`,
 end-to-end test caught jimmy/mila serving Sonnet for chili on the
 first run because only smart had been patched. Sweep the test against
 every proxy, not the canonical one, before declaring done.
+
+## Sibling-proxy port and request-shaping patches live in 3 places, not 1
+
+The `local/`-prefix model bypass (skip 9Router, forward directly to the
+SGLang container) is hardcoded in every sibling proxy:
+
+- `~/semantic-router/smart-router-proxy.py` (port 8898)
+- `~/semantic-router/jimmy-router-proxy.py` (port 8901)
+- `~/semantic-router/mila-router-proxy.py` (port 8902)
+
+When changing the local port or the served model name (e.g. swap from
+the 27B abliterated on :11434 to a 30B-A3B MoE on :11435 to a MOA
+gateway hermes-agent on :8642), patch all three identically. Verified
+Sep 21 2026: a single-file patch leaves the others silently 503ing on
+`local/` requests with `{"error":{"message":"All models unavailable"}}`
+— their hardcoded URL still points at the old port and the model name
+in their auth header may also be stale. The 503 is misleading:
+every upstream is fine, but none will accept the empty auth or the
+stale model identifier in the forward path. As of Sep 21 PM the
+forward URL/auth in all three proxies comes from `MOA_LOCAL_*` env
+vars on the systemd units — change those (drop-ins at
+`~/.config/systemd/user/<unit>.service.d/moa-local.conf`) rather than
+the proxy code itself.
+
+## Force `chat_template_kwargs: {enable_thinking: false}` at the local-bypass point
+
+The Qwen3-Instruct-2507 family is configured non-thinking by default
+per its model card, but in practice still emits responses into
+`reasoning_content` with **empty `content`** for many prompts. The
+`_strip_think()` helper does NOT promote `reasoning_content` into
+`content` — it only removes `<think>...</think>` blocks. Result: the
+proxy returns HTTP 200 with `content: ''`, looks healthy, but every
+chat hits the user as a blank response.
+
+Verified Sep 21 2026 against `NVFP4/Qwen3-30B-A3B-Instruct-2507-FP4`
+across all three sibling proxies. Force the kwarg at the forward
+path immediately before constructing the `urllib.request.Request`
+for `local/` slugs:
+
+```python
+if model.startswith("local/"):
+    payload['model'] = model.split("/", 1)[1]
+    _url = 'http://127.0.0.1:<local-port>/v1/chat/completions'
+    _auth = 'Bearer no-key-required'
+    payload.setdefault('chat_template_kwargs', {})['enable_thinking'] = False
+else:
+    _url = 'http://127.0.0.1:20128/v1/chat/completions'
+    _auth = self.headers.get('Authorization', '')
+```
+
+Apply to **all three sibling proxies**, not just the default. The
+default proxy on 8898 may be patched while jimmy (8901) and mila
+(8902) keep dropping content. Verify with a per-port content check
+(`for port in 8898 8901 8902; curl ...; assert content != ''`), not a
+smoke test on one port.
+
+Full breakdown: `references/qwen3-thinking-trap.md` (under
+`llm-serving-benchmarking`).
 
 ### Proxy returns 503 / "All models unavailable" because the caller forgot the Authorization header
 
@@ -1568,6 +1773,39 @@ Sync `DOMAIN_TO_TIER` from the canonical proxy and verify with a parity check
 comparing hardening flags + tier blocks across all copies
 (`~/semantic-router/check_parity.py`).
 
+### Sibling-session silent revert of `router_tiers.py`
+
+Even with no drift between proxy copies, a sibling agent (cron job, parallel
+debug session, an LLM agent working on a DFlash experiment) can edit
+`router_tiers.py` and silently revert a prior change — verified Sep 21 2026
+PM: a sibling move from `local/qwen3-30b-a3b-instruct-2507` to
+`local/hermes-agent` (MOA gateway @ :8642) was reverted back to
+`local/qwen3-30b-a3b-instruct-2507` between sessions, with no error and
+no log line. The proxies kept serving MOA because `MOA_LOCAL_URL` env
+vars were unchanged, but `tier_local.models` no longer matched the
+advertised model — a silent discrepancy between source-of-truth and
+advertised behavior.
+
+**Always re-print the live tier table immediately before claiming a swap is
+correct**, not just before declaring "done". One-line probe:
+
+```bash
+python3 -c "import sys;sys.path.insert(0,'/path/to/semantic-router');\
+from router_tiers import TIER_SYSTEM;\
+print('tier_local:', TIER_SYSTEM['tier_local']['models']);\
+print('tier_fallback[-1]:', TIER_SYSTEM['tier_fallback']['models'][-1])"
+```
+
+If the printed model doesn't match what you set, treat the change as
+uncommitted and re-apply. Document the swap in
+`~/.hermes/skills/mlops/spark-local-llm-model-swap/SKILL.md`'s
+pitfalls list (sibling-agent silent revert) and in the tier table
+header comment so future readers see the history. For long-term
+hardening: a `scripts/verify-moa-wiring.sh` (or whichever local model is
+current) that asserts `tier_local.models == [<expected>]` and exits
+non-zero on drift is cheap and catches this class of regression
+without a manual probe.
+
 ### sglang/vLLM/ollama binds to Tailscale-only — local judge silently fails open
 
 sglang and vLLM commonly bind to a single interface (Tailscale IPv4/IPv6, or the LAN IP) instead of `0.0.0.0`, so a `ROUTER_JUDGE_LOCAL_URL=http://127.0.0.1:11434/v1` config will 000-refuse-connection from the proxy even when the local model is healthy. Symptom: `escalation_judged` increments but `judge_local_used` stays 0 and `judge_unreachable` doesn't move either — because the cloud chain quietly answers through 9router. The local judge path looks "alive" because `JUDGE_USE_LOCAL` is True, but every local call is hitting `Connection refused`, and the only way to find out is to read the proxy log for `local_judge_unreachable` or grep the journal.
@@ -1882,11 +2120,18 @@ in all 3 cheap tiers of `router_tiers.py` + 8 nine-router combos
 While glm-cn is 429-capped the circuit breaker skips straight to the Alibaba
 segment — the cheap lane has a working non-MiniMax option for the first time.
 
-**Judge (user decision A — local primary):** local `qwen38-27b-abliterated`
-(sglang :11434, free) stays primary; `alitp-intl/qwen3.6-flash` is the
-fallback ahead of GLM/M3. Env on all 3 units:
-`JUDGE_MODELS=qwen38-27b-abliterated,alitp-intl/qwen3.6-flash,glm-cn/glm-5.3-flash,alitp-intl/deepseek-v4-pro,minimax/MiniMax-M3`
-plus `ROUTER_JUDGE_LOCAL_URL`/`ROUTER_JUDGE_LOCAL_MODEL`.
+**Judge (user decision A — local primary):** local MOA `hermes-agent`
+(MOA gateway @ 127.0.0.1:8642, free) is the primary judge as of
+Sep 21 PM 2026 (was SGLang `qwen38-27b-abliterated` @ :11434 same
+day); `alitp-intl/qwen3.6-flash` is the cloud fallback ahead of
+GLM/M3. Env on all 3 units:
+`JUDGE_MODELS=hermes-agent,alitp-intl/qwen3.6-flash,glm-cn/glm-5.3-flash,alitp-intl/deepseek-v4-pro,minimax/MiniMax-M3`
+plus `ROUTER_JUDGE_LOCAL_URL`/`ROUTER_JUDGE_LOCAL_MODEL`/
+`ROUTER_JUDGE_LOCAL_KEY`. The MOA key is sourced from
+`~/.hermes/.env`'s `API_SERVER_KEY` and inlined into the systemd
+drop-in (`Environment=MOA_LOCAL_KEY=${API_SERVER_KEY}` does NOT
+substitute — `Environment=` lines don't see `EnvironmentFile=` vars
+in drop-ins; inlining the literal value is the only path).
 
 **Sep 9 2026: `glm-cn/glm-5.2` removed from the judge chain** — it is a
 200k-context model and the standing policy is 1M-only for anything
